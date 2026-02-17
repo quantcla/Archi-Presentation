@@ -2737,6 +2737,7 @@ const SimulationViewer = ({
           color: h.color,
           sectionCutAction: h.sectionCutAction,
           linkedImage: h.linkedImage,
+          linked360Image: h.linked360Image,
         })),
         sectionCut: s.sectionCut,
       }));

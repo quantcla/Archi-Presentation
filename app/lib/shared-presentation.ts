@@ -47,6 +47,7 @@ export interface SharedHotspot {
   color: string;
   sectionCutAction?: { enabled: boolean; height: number };
   linkedImage?: string;
+  linked360Image?: string;
 }
 
 export function generateShareId(): string {

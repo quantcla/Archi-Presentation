@@ -14,6 +14,7 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
   const [activeSlideIndex, setActiveSlideIndex] = useState(0);
   const [pdfPanelOpen, setPdfPanelOpen] = useState(false);
   const [activeHotspotId, setActiveHotspotId] = useState<string | null>(null);
+  const [panoramaImage, setPanoramaImage] = useState<string | null>(null);
   const loadedModelsRef = useRef<Map<string, THREE.Group>>(new Map());
   const hotspotMeshesRef = useRef<Map<string, THREE.Mesh>>(new Map());
   const isLoadingRef = useRef(false);
@@ -31,7 +32,6 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
     const loader = new GLTFLoader();
 
     const loadModel = async (model: SharedModel) => {
-      // Use direct blob URL if available, fall back to API proxy
       const url = model.glbUrl || `/api/share/${presentation.id}/files/${model.glbFilename}`;
       return new Promise<void>((resolve) => {
         loader.load(
@@ -43,7 +43,6 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
             group.rotation.set(model.rotation.x, model.rotation.y, model.rotation.z);
             group.scale.set(model.scale.x, model.scale.y, model.scale.z);
 
-            // Enable shadow casting
             group.traverse((child) => {
               if (child instanceof THREE.Mesh) {
                 child.castShadow = true;
@@ -65,7 +64,6 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
     };
 
     Promise.all(presentation.models.map(loadModel)).then(() => {
-      // Fit camera to all loaded models
       const box = new THREE.Box3();
       loadedModelsRef.current.forEach((group) => {
         box.expandByObject(group);
@@ -73,12 +71,10 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
       if (!box.isEmpty()) {
         fitToBox(box);
       }
-      // Apply initial slide visibility
       updateSlideVisibility(0);
     });
 
     return () => {
-      // Cleanup models on unmount
       loadedModelsRef.current.forEach((group) => {
         scene.remove(group);
         group.traverse((child) => {
@@ -100,11 +96,9 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
 
     const visibleIds = new Set(slide.modelIds);
     loadedModelsRef.current.forEach((group, modelId) => {
-      // If slide has no models assigned, show all
       group.visible = visibleIds.size === 0 || visibleIds.has(modelId);
     });
 
-    // Apply section cut
     if (slide.sectionCut?.enabled) {
       setSectionPlane(slide.sectionCut.height);
     } else {
@@ -116,7 +110,6 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
   useEffect(() => {
     if (!scene) return;
 
-    // Remove old hotspot meshes
     hotspotMeshesRef.current.forEach((mesh) => {
       scene.remove(mesh);
       mesh.geometry.dispose();
@@ -124,7 +117,6 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
     });
     hotspotMeshesRef.current.clear();
 
-    // Create new hotspot meshes for active slide
     const slide = presentation.slides[activeSlideIndex];
     if (!slide) return;
 
@@ -171,12 +163,18 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
         e.preventDefault();
         goToSlide(activeSlideIndex - 1);
       } else if (e.key === 'Escape') {
-        setActiveHotspotId(null);
+        if (panoramaImage) {
+          const container = document.querySelector('[data-pano-initialized="true"]') as any;
+          if (container?._panoCleanup) container._panoCleanup();
+          setPanoramaImage(null);
+        } else {
+          setActiveHotspotId(null);
+        }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [activeSlideIndex, goToSlide]);
+  }, [activeSlideIndex, goToSlide, panoramaImage]);
 
   // Handle click on viewport for hotspot interaction
   const handleViewportClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
@@ -191,7 +189,6 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
     const raycaster = new THREE.Raycaster();
     raycaster.setFromCamera(mouse, camera);
 
-    // Check hotspot intersections
     const hotspotMeshes = Array.from(hotspotMeshesRef.current.values());
     const intersects = raycaster.intersectObjects(hotspotMeshes);
 
@@ -201,8 +198,8 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
       if (hotspot) {
         setActiveHotspotId(hotspotId);
 
-        // Animate camera to saved view
-        if (hotspot.savedView && controls) {
+        // Animate camera to saved view (skip if 360 — will open panorama instead)
+        if (hotspot.savedView && controls && !hotspot.linked360Image) {
           const target = new THREE.Vector3(
             hotspot.savedView.target.x,
             hotspot.savedView.target.y,
@@ -214,7 +211,6 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
             hotspot.savedView.position.z
           );
 
-          // Simple animation
           const startPos = camera.position.clone();
           const startTarget = controls.target.clone();
           const duration = 800;
@@ -248,7 +244,6 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
   const closeHotspot = useCallback(() => {
     const hotspot = activeSlide?.hotspots.find(h => h.id === activeHotspotId);
     setActiveHotspotId(null);
-    // Deactivate section cut if hotspot had one
     if (hotspot?.sectionCutAction?.enabled) {
       const slide = presentation.slides[activeSlideIndex];
       if (slide?.sectionCut?.enabled) {
@@ -258,6 +253,8 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
       }
     }
   }, [activeHotspotId, activeSlide, activeSlideIndex, presentation.slides, setSectionPlane]);
+
+  const hasImage = activeHotspot ? !!activeHotspot.linkedImage : false;
 
   return (
     <div className="flex flex-col h-screen w-full bg-gray-100">
@@ -341,30 +338,89 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
         </div>
 
         {/* 3D Viewport */}
-        <div className="flex-1 relative" onClick={handleViewportClick}>
+        <div className="flex-1 relative min-w-0" onClick={handleViewportClick}>
           <ViewerCanvas />
 
-          {/* Hotspot popup */}
+          {/* Hotspot popup — centered at bottom, matching main app style */}
           {activeHotspot && (
-            <div className="absolute top-4 left-4 bg-white rounded-xl shadow-2xl border border-gray-200 max-w-sm z-20 overflow-hidden">
-              <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
-                <div className="flex items-center gap-2">
-                  <div className="w-3 h-3 rounded-full" style={{ backgroundColor: activeHotspot.color || '#3b82f6' }} />
-                  <h3 className="font-semibold text-sm text-gray-900">{activeHotspot.name}</h3>
+            <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-50 bg-white rounded-xl shadow-xl border border-orange-200 overflow-hidden flex" style={{ minWidth: hasImage ? '560px' : '280px', maxWidth: '900px' }}>
+              {/* Left Side - Info */}
+              <div className="flex-1 min-w-[280px]">
+                {/* Header */}
+                <div className="bg-gradient-to-r from-orange-50 to-orange-100 px-4 py-3 border-b border-orange-200">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <div
+                        className="w-5 h-5 rounded-full shadow-sm border border-white/50"
+                        style={{ backgroundColor: activeHotspot.color || '#3b82f6' }}
+                      />
+                      <h3 className="font-semibold text-gray-800">{activeHotspot.name}</h3>
+                    </div>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); closeHotspot(); }}
+                      className="p-1 text-gray-400 hover:text-gray-600 hover:bg-white/50 rounded transition"
+                    >
+                      <X size={18} />
+                    </button>
+                  </div>
                 </div>
-                <button onClick={(e) => { e.stopPropagation(); closeHotspot(); }}
-                  className="p-1 rounded-md hover:bg-gray-100 text-gray-400">
-                  <X size={14} />
-                </button>
+
+                {/* Description */}
+                {activeHotspot.description && (
+                  <div className="px-4 py-2 border-b border-gray-100">
+                    <p className="text-sm text-gray-600 whitespace-pre-wrap">{activeHotspot.description}</p>
+                  </div>
+                )}
+
+                {/* Section Cut Info */}
+                {activeHotspot.sectionCutAction?.enabled && (
+                  <div className="px-4 py-3 space-y-2 border-b border-gray-100">
+                    <div className="flex items-center gap-2 text-sm">
+                      <div className="w-6 h-6 rounded bg-blue-100 flex items-center justify-center">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" strokeWidth="2">
+                          <path d="M2 12h20"/>
+                          <path d="M6 8l-4 4 4 4"/>
+                          <path d="M18 8l4 4-4 4"/>
+                        </svg>
+                      </div>
+                      <span className="text-gray-600">Section Cut</span>
+                      <span className="ml-auto font-medium text-blue-600">
+                        {activeHotspot.sectionCutAction.height.toFixed(1)}m
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Actions */}
+                <div className="px-4 py-3 bg-gray-50 flex items-center justify-end gap-2">
+                  {activeHotspot.linked360Image && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setPanoramaImage(activeHotspot.linked360Image!); }}
+                      className="px-4 py-2 bg-cyan-600 hover:bg-cyan-700 text-white text-sm font-medium rounded-lg transition flex items-center gap-2 shadow-sm"
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <circle cx="12" cy="12" r="10"/>
+                        <path d="M2 12h20"/>
+                        <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+                      </svg>
+                      View 360°
+                    </button>
+                  )}
+                </div>
               </div>
-              {activeHotspot.description && (
-                <div className="px-4 py-3 text-sm text-gray-600">
-                  {activeHotspot.description}
-                </div>
-              )}
-              {activeHotspot.linkedImage && (
-                <div className="border-t border-gray-100">
-                  <img src={activeHotspot.linkedImage} alt={activeHotspot.name} className="w-full h-auto max-h-48 object-cover" />
+
+              {/* Right Side - Image */}
+              {hasImage && (
+                <div
+                  className="border-l border-gray-200 bg-gray-50 flex items-center justify-center p-3"
+                  style={{ width: '280px', minWidth: '150px' }}
+                >
+                  <img
+                    src={activeHotspot.linkedImage}
+                    alt={activeHotspot.name}
+                    className="max-w-full max-h-[200px] object-contain rounded-lg shadow-sm"
+                    draggable={false}
+                  />
                 </div>
               )}
             </div>
@@ -373,7 +429,7 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
 
         {/* Right panel: PDF */}
         {pdfPanelOpen && presentation.pdfFilename && (
-          <div className="w-80 bg-white border-l shadow-xl flex flex-col shrink-0 h-full">
+          <div className="w-[400px] bg-white border-l shadow-xl flex flex-col shrink-0" style={{ height: '100%' }}>
             <div className="p-4 border-b flex items-center justify-between shrink-0">
               <h3 className="font-bold text-sm flex items-center gap-2">
                 <FileText size={16} className="text-blue-600" />
@@ -384,7 +440,7 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
                 <PanelRightClose size={16} />
               </button>
             </div>
-            <div className="flex-1 min-h-0">
+            <div className="flex-1 min-h-0 overflow-hidden">
               <iframe
                 src={presentation.pdfUrl || `/api/share/${presentation.id}/files/${presentation.pdfFilename}`}
                 className="w-full h-full border-0"
@@ -394,6 +450,133 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
           </div>
         )}
       </div>
+
+      {/* 360 Panorama Viewer */}
+      {panoramaImage && (
+        <div className="fixed inset-0 z-[110] bg-black">
+          <div
+            ref={(containerEl) => {
+              if (!containerEl || containerEl.dataset.panoInitialized) return;
+              containerEl.dataset.panoInitialized = 'true';
+
+              const panoScene = new THREE.Scene();
+              const panoCamera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+              panoCamera.position.set(0, 0, 0.01);
+
+              const panoRenderer = new THREE.WebGLRenderer({ antialias: true });
+              panoRenderer.setSize(window.innerWidth, window.innerHeight);
+              panoRenderer.setPixelRatio(window.devicePixelRatio);
+              containerEl.appendChild(panoRenderer.domElement);
+
+              const geometry = new THREE.SphereGeometry(500, 60, 40);
+              geometry.scale(-1, 1, 1);
+              const texture = new THREE.TextureLoader().load(panoramaImage!);
+              texture.colorSpace = THREE.SRGBColorSpace;
+              const material = new THREE.MeshBasicMaterial({ map: texture });
+              const sphere = new THREE.Mesh(geometry, material);
+              panoScene.add(sphere);
+
+              let lon = 0, lat = 0;
+              let isDown = false;
+              let startX = 0, startY = 0;
+              let startLon = 0, startLat = 0;
+
+              const onPointerDown = (e: PointerEvent) => {
+                isDown = true;
+                startX = e.clientX;
+                startY = e.clientY;
+                startLon = lon;
+                startLat = lat;
+              };
+              const onPointerMove = (e: PointerEvent) => {
+                if (!isDown) return;
+                lon = (startX - e.clientX) * 0.2 + startLon;
+                lat = (e.clientY - startY) * 0.2 + startLat;
+                lat = Math.max(-85, Math.min(85, lat));
+              };
+              const onPointerUp = () => { isDown = false; };
+
+              const onWheel = (e: WheelEvent) => {
+                const fov = panoCamera.fov + e.deltaY * 0.05;
+                panoCamera.fov = Math.max(30, Math.min(100, fov));
+                panoCamera.updateProjectionMatrix();
+              };
+
+              const dom = panoRenderer.domElement;
+              dom.addEventListener('pointerdown', onPointerDown);
+              dom.addEventListener('pointermove', onPointerMove);
+              dom.addEventListener('pointerup', onPointerUp);
+              dom.addEventListener('pointerleave', onPointerUp);
+              dom.addEventListener('wheel', onWheel);
+
+              const onResize = () => {
+                panoCamera.aspect = window.innerWidth / window.innerHeight;
+                panoCamera.updateProjectionMatrix();
+                panoRenderer.setSize(window.innerWidth, window.innerHeight);
+              };
+              window.addEventListener('resize', onResize);
+
+              let animId = 0;
+              const animate = () => {
+                animId = requestAnimationFrame(animate);
+                const phi = THREE.MathUtils.degToRad(90 - lat);
+                const theta = THREE.MathUtils.degToRad(lon);
+                const target = new THREE.Vector3(
+                  500 * Math.sin(phi) * Math.cos(theta),
+                  500 * Math.cos(phi),
+                  500 * Math.sin(phi) * Math.sin(theta)
+                );
+                panoCamera.lookAt(target);
+                panoRenderer.render(panoScene, panoCamera);
+              };
+              animate();
+
+              (containerEl as any)._panoCleanup = () => {
+                cancelAnimationFrame(animId);
+                dom.removeEventListener('pointerdown', onPointerDown);
+                dom.removeEventListener('pointermove', onPointerMove);
+                dom.removeEventListener('pointerup', onPointerUp);
+                dom.removeEventListener('pointerleave', onPointerUp);
+                dom.removeEventListener('wheel', onWheel);
+                window.removeEventListener('resize', onResize);
+                panoRenderer.dispose();
+                geometry.dispose();
+                material.dispose();
+                texture.dispose();
+              };
+            }}
+            className="w-full h-full"
+            style={{ cursor: 'grab' }}
+            onMouseDown={(e) => { (e.target as HTMLElement).style.cursor = 'grabbing'; }}
+            onMouseUp={(e) => { (e.target as HTMLElement).style.cursor = 'grab'; }}
+          />
+          {/* Close button */}
+          <button
+            onClick={() => {
+              const container = document.querySelector('[data-pano-initialized="true"]') as any;
+              if (container?._panoCleanup) container._panoCleanup();
+              setPanoramaImage(null);
+            }}
+            className="absolute top-6 right-6 p-3 bg-black/50 hover:bg-black/70 text-white rounded-full transition-colors z-10"
+            title="Close 360° view"
+          >
+            <X size={24} />
+          </button>
+          {/* 360 badge */}
+          <div className="absolute top-6 left-6 px-3 py-1.5 bg-black/50 text-white rounded-full text-sm font-bold flex items-center gap-2 z-10">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="12" cy="12" r="10"/>
+              <path d="M2 12h20"/>
+              <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+            </svg>
+            360° Panorama
+          </div>
+          {/* Instructions */}
+          <div className="absolute bottom-6 left-1/2 -translate-x-1/2 text-white/60 text-sm z-10">
+            Drag to look around · Scroll to zoom · ESC to close
+          </div>
+        </div>
+      )}
     </div>
   );
 }
