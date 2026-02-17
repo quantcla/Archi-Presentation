@@ -1,0 +1,1449 @@
+# Blender Add-on: Elevation Builder — STRICT 90° ALIGN + Robust ON/OFF grouping
+# -------------------------------------------------------------------------------------------------------------
+# VERSION 6.5.0 (NO-MERGE PART OUTPUT + CUTTER PADDING + SAFER CLEANUP)
+#
+# Key changes:
+# - Builds separate mesh objects per ON group (on-<gid>) and subtracts its OFF subgroups (off-<gid>-<sid>).
+# - Does NOT UNION parts into one mesh anymore (prevents accumulated boolean damage / dents).
+# - Optional base BLACK/GREY is also kept as its own part object.
+# - Adds cutter padding (slight expansion) to avoid coplanar boolean faces -> fewer dents.
+# - Cleanup is safer: avoids aggressive merge-by-distance on final results.
+#
+# Export:
+# - You can export the whole EB_Output collection as OBJ manually; it will contain multiple objects (parts).
+#
+# NAMING:
+#   on-1               -> ON group id "1"
+#   off-1-1, off-1-2   -> OFF subgroup ids "1","2" that subtract ONLY from on-1
+#   off-1              -> OFF subgroup id "0" that subtracts from on-1
+#
+# Output:
+#   - Creates/updates objects in collection: EB_Output
+#   - Part objects:
+#       EB_Base_BLACK (optional)
+#       EB_Base_GREY  (optional cutter part, deleted after subtract)
+#       EB_Part_ON_<gid>
+#   - Optional: EB_TopPlane (work plane for drawing)
+
+bl_info = {
+    "name": "Elevation Builder (No-Merge Parts + Safer Booleans)",
+    "author": "Alpha Quant + ChatGPT (v6.5.0)",
+    "version": (6, 5, 0),
+    "blender": (3, 0, 0),
+    "location": "View3D > Sidebar (N) > Elevation Builder",
+    "category": "Object",
+}
+
+import bpy
+import bmesh
+import math
+import re
+from mathutils import Vector, Matrix
+from bpy.types import Operator, Panel, PropertyGroup
+from bpy.props import (
+    FloatProperty, PointerProperty, BoolProperty,
+    StringProperty
+)
+
+# --------------------------------------------------------------------------------------
+# Utilities: selection + mode + CLEANUP
+# --------------------------------------------------------------------------------------
+
+def ensure_object_mode():
+    try:
+        if bpy.context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+    except Exception:
+        pass
+
+def deselect_all():
+    try:
+        bpy.ops.object.select_all(action="DESELECT")
+    except Exception:
+        pass
+
+def set_active(obj):
+    bpy.context.view_layer.objects.active = obj
+
+def clean_mesh_geometry(obj, merge_dist=0.0):
+    """
+    Safer cleanup:
+    - optional merge_by_distance (default OFF for final meshes)
+    - normals consistent
+    - delete loose
+    """
+    if not obj or obj.type != 'MESH':
+        return
+    ensure_object_mode()
+    deselect_all()
+    obj.select_set(True)
+    set_active(obj)
+
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+
+    if merge_dist and merge_dist > 0.0:
+        try:
+            bpy.ops.mesh.merge_by_distance(distance=float(merge_dist))
+        except Exception:
+            try:
+                bpy.ops.mesh.remove_doubles(threshold=float(merge_dist))
+            except Exception:
+                pass
+
+    try:
+        bpy.ops.mesh.normals_make_consistent(inside=False)
+    except Exception:
+        pass
+
+    try:
+        bpy.ops.mesh.delete_loose()
+    except Exception:
+        pass
+
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+# --------------------------------------------------------------------------------------
+# Collections / scene scanning
+# --------------------------------------------------------------------------------------
+
+def collection_all_objects(col):
+    out = []
+    def walk(c):
+        out.extend(list(c.objects))
+        for ch in c.children:
+            walk(ch)
+    walk(col)
+    seen = set()
+    uniq = []
+    for o in out:
+        if o and o.name not in seen:
+            uniq.append(o)
+            seen.add(o.name)
+    return uniq
+
+def collection_has_geom(col):
+    for o in collection_all_objects(col):
+        if o.type in {"CURVE", "MESH"}:
+            return True
+    return False
+
+def find_candidate_collections(scene):
+    return [c for c in scene.collection.children if collection_has_geom(c)]
+
+# --------------------------------------------------------------------------------------
+# Material/color helpers
+# --------------------------------------------------------------------------------------
+
+def _clamp01(x):
+    return max(0.0, min(1.0, float(x)))
+
+def material_rgb(mat):
+    if not mat:
+        return None
+    if getattr(mat, "use_nodes", False) and mat.node_tree:
+        for n in mat.node_tree.nodes:
+            if n.type == "BSDF_PRINCIPLED":
+                inp = n.inputs.get("Base Color")
+                if inp and hasattr(inp, "default_value"):
+                    rgba = inp.default_value
+                    return (_clamp01(rgba[0]), _clamp01(rgba[1]), _clamp01(rgba[2]))
+    try:
+        rgba = mat.diffuse_color
+        return (_clamp01(rgba[0]), _clamp01(rgba[1]), _clamp01(rgba[2]))
+    except Exception:
+        return None
+
+def color_close(c, target, tol):
+    return (abs(c[0]-target[0]) <= tol and abs(c[1]-target[1]) <= tol and abs(c[2]-target[2]) <= tol)
+
+def is_red(c, tol):    return color_close(c, (1,0,0), tol)
+def is_green(c, tol):  return color_close(c, (0,1,0), tol)
+def is_blue(c, tol):   return color_close(c, (0,0,1), tol)
+def is_yellow(c, tol): return color_close(c, (1,1,0), tol)
+def is_cyan(c, tol):   return color_close(c, (0,1,1), tol)
+def is_pink(c, tol):   return color_close(c, (1,0,1), tol)
+def is_purple(c, tol): return color_close(c, (0.5, 0, 0.5), tol)
+def is_orange(c, tol): return color_close(c, (1, 0.647, 0), tol)
+
+def is_black(c, tol):
+    return (c[0] <= tol and c[1] <= tol and c[2] <= tol)
+
+def is_grey(c, eq_tol, gmin, gmax):
+    if c[0] < gmin or c[0] > gmax: return False
+    if c[1] < gmin or c[1] > gmax: return False
+    if c[2] < gmin or c[2] > gmax: return False
+    return (abs(c[0]-c[1]) <= eq_tol and abs(c[1]-c[2]) <= eq_tol)
+
+def obj_any_material_matches(obj, predicate):
+    if not obj or obj.type not in {"CURVE","MESH"}:
+        return False
+    try:
+        mats = list(obj.data.materials) if hasattr(obj.data, "materials") else []
+    except Exception:
+        mats = []
+    for m in mats:
+        rgb = material_rgb(m)
+        if rgb and predicate(rgb):
+            return True
+    return False
+
+def get_obj_primary_color(obj):
+    if not obj or obj.type not in {"CURVE","MESH"}:
+        return None
+    try:
+        mats = list(obj.data.materials) if hasattr(obj.data, "materials") else []
+        if mats:
+            return material_rgb(mats[0])
+    except Exception:
+        pass
+    return None
+
+# --------------------------------------------------------------------------------------
+# Strict 90° math helpers
+# --------------------------------------------------------------------------------------
+
+def snap_to_90_deg(angle_deg):
+    return round(angle_deg / 90.0) * 90.0
+
+def snap_axis_to_world(axis: Vector):
+    a = axis.normalized()
+    candidates = [
+        Vector((1,0,0)), Vector((-1,0,0)),
+        Vector((0,1,0)), Vector((0,-1,0)),
+        Vector((0,0,1)), Vector((0,0,-1)),
+    ]
+    best = candidates[0]
+    best_dot = -1e9
+    for c in candidates:
+        d = a.dot(c)
+        if d > best_dot:
+            best_dot = d
+            best = c
+    return best
+
+def best_perpendicular_world_axis(v: Vector):
+    v = v.normalized()
+    candidates = [Vector((1,0,0)), Vector((0,1,0)), Vector((0,0,1))]
+    best = candidates[0]
+    best_score = 1e9
+    for c in candidates:
+        score = abs(v.dot(c))
+        if score < best_score:
+            best_score = score
+            best = c
+    return best
+
+def axis_angle_to_map_world_axes(from_axis: Vector, to_axis: Vector):
+    f = snap_axis_to_world(from_axis)
+    t = snap_axis_to_world(to_axis)
+    d = f.dot(t)
+    if d > 0.999:
+        return Vector((0,0,1)), 0.0
+    if d < -0.999:
+        perp = best_perpendicular_world_axis(f)
+        rot_axis = snap_axis_to_world(perp.cross(f))
+        if rot_axis.length < 1e-8:
+            rot_axis = Vector((0,0,1))
+        return rot_axis, 180.0
+    rot_axis = f.cross(t)
+    if rot_axis.length < 1e-8:
+        rot_axis = best_perpendicular_world_axis(f)
+    rot_axis = snap_axis_to_world(rot_axis)
+    return rot_axis, 90.0
+
+def simulate_rotate_point(point: Vector, pivot: Vector, axis: Vector, angle_deg: float) -> Vector:
+    axis = axis.normalized()
+    M = Matrix.Translation(pivot) @ Matrix.Rotation(math.radians(angle_deg), 4, axis) @ Matrix.Translation(-pivot)
+    return M @ point
+
+# --------------------------------------------------------------------------------------
+# Geometry extraction & Markers
+# --------------------------------------------------------------------------------------
+
+def world_verts(obj):
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    obj_eval = obj.evaluated_get(depsgraph)
+    try:
+        me = obj_eval.to_mesh()
+    except Exception:
+        return []
+    verts = [obj_eval.matrix_world @ v.co for v in me.vertices]
+    obj_eval.to_mesh_clear()
+    return verts
+
+def center_of_verts(verts):
+    if not verts:
+        return Vector((0,0,0))
+    s = Vector((0,0,0))
+    for v in verts:
+        s += v
+    return s / float(len(verts))
+
+def major_axis_from_farthest_pair(verts):
+    if len(verts) < 2:
+        return Vector((0,0,1))
+    best_d = -1.0
+    a = verts[0]
+    b = verts[1]
+    for i in range(len(verts)):
+        vi = verts[i]
+        for j in range(i+1, len(verts)):
+            d = (verts[j] - vi).length_squared
+            if d > best_d:
+                best_d = d
+                a, b = vi, verts[j]
+    axis = (b - a)
+    if axis.length < 1e-9:
+        return Vector((0,0,1))
+    return axis.normalized()
+
+MARKERS = ("RED","BLUE","GREEN","YELLOW","CYAN","PINK","PURPLE","ORANGE")
+
+def color_predicate(name, tol):
+    if name == "RED":    return lambda rgb: is_red(rgb, tol)
+    if name == "BLUE":   return lambda rgb: is_blue(rgb, tol)
+    if name == "GREEN":  return lambda rgb: is_green(rgb, tol)
+    if name == "YELLOW": return lambda rgb: is_yellow(rgb, tol)
+    if name == "CYAN":   return lambda rgb: is_cyan(rgb, tol)
+    if name == "PINK":   return lambda rgb: is_pink(rgb, tol)
+    if name == "PURPLE": return lambda rgb: is_purple(rgb, tol)
+    if name == "ORANGE": return lambda rgb: is_orange(rgb, tol)
+    return lambda rgb: False
+
+def best_color_object_and_verts(col, color_name, tol):
+    pred = color_predicate(color_name, tol)
+    best = None
+    best_diag = -1.0
+    best_verts = []
+    for o in collection_all_objects(col):
+        if o.type not in {"CURVE","MESH"}:
+            continue
+        if not obj_any_material_matches(o, pred):
+            continue
+        verts = world_verts(o)
+        if len(verts) < 2:
+            continue
+        minv = Vector((min(v.x for v in verts), min(v.y for v in verts), min(v.z for v in verts)))
+        maxv = Vector((max(v.x for v in verts), max(v.y for v in verts), max(v.z for v in verts)))
+        diag = (maxv - minv).length
+        if diag > best_diag:
+            best_diag = diag
+            best = o
+            best_verts = verts
+    return best, best_verts
+
+def marker_present(col, color_name, tol):
+    o, verts = best_color_object_and_verts(col, color_name, tol)
+    return bool(o and verts)
+
+def marker_set(col, tol):
+    s = set()
+    for n in MARKERS:
+        if marker_present(col, n, tol):
+            s.add(n)
+    return s
+
+def marker_center_axis(col, color_name, tol):
+    _, verts = best_color_object_and_verts(col, color_name, tol)
+    if not verts:
+        return None, None
+    c = center_of_verts(verts)
+    axis = major_axis_from_farthest_pair(verts)
+    axis = snap_axis_to_world(axis)
+    if axis.z < -0.99:
+        axis = -axis
+    return c, axis
+
+def get_collection_center(col):
+    total = Vector((0,0,0))
+    count = 0
+    for o in collection_all_objects(col):
+        if o.type in {"MESH", "CURVE"}:
+            vs = world_verts(o)
+            if vs:
+                total += center_of_verts(vs)
+                count += 1
+    if count == 0:
+        return Vector((0,0,0))
+    return total / count
+
+def get_collection_bounds(col):
+    all_verts = []
+    for o in collection_all_objects(col):
+        if o.type in {"MESH", "CURVE"}:
+            all_verts.extend(world_verts(o))
+    if not all_verts:
+        return Vector((0,0,0)), Vector((0,0,0))
+    minv = Vector((min(v.x for v in all_verts), min(v.y for v in all_verts), min(v.z for v in all_verts)))
+    maxv = Vector((max(v.x for v in all_verts), max(v.y for v in all_verts), max(v.z for v in all_verts)))
+    return minv, maxv
+
+def get_bounds_of_collections(cols):
+    all_verts = []
+    for col in cols:
+        if not col:
+            continue
+        for o in collection_all_objects(col):
+            if o.type in {"MESH", "CURVE"}:
+                all_verts.extend(world_verts(o))
+    if not all_verts:
+        return Vector((0,0,0)), Vector((0,0,0))
+    minv = Vector((min(v.x for v in all_verts), min(v.y for v in all_verts), min(v.z for v in all_verts)))
+    maxv = Vector((max(v.x for v in all_verts), max(v.y for v in all_verts), max(v.z for v in all_verts)))
+    return minv, maxv
+
+# --------------------------------------------------------------------------------------
+# Stand-up (only if flat)
+# --------------------------------------------------------------------------------------
+
+def marker_centers(col, tol):
+    pts = []
+    for name in MARKERS:
+        c, _ = marker_center_axis(col, name, tol)
+        if c:
+            pts.append(c)
+    return pts
+
+def should_stand_up(col, tol, eps=1e-5):
+    pts = marker_centers(col, tol)
+    if not pts:
+        return False
+    zmin = min(p.z for p in pts)
+    zmax = max(p.z for p in pts)
+    return (zmax - zmin) < eps
+
+def rotate_collection_around_axis(col, pivot, axis, angle_deg):
+    axis = axis.normalized()
+    R = Matrix.Rotation(math.radians(angle_deg), 4, axis)
+    T1 = Matrix.Translation(pivot)
+    T2 = Matrix.Translation(-pivot)
+    M = T1 @ R @ T2
+    for o in collection_all_objects(col):
+        o.matrix_world = M @ o.matrix_world
+
+def stand_up_collection(col, tol):
+    pts = marker_centers(col, tol)
+    if not pts:
+        return
+    pivot = sum(pts, Vector((0,0,0))) / float(len(pts))
+    rotate_collection_around_axis(col, pivot, Vector((1,0,0)), 90.0)
+
+# --------------------------------------------------------------------------------------
+# Panel normals (twist alignment)
+# --------------------------------------------------------------------------------------
+
+def project_perp(v: Vector, axis: Vector):
+    a = axis.normalized()
+    return v - a * v.dot(a)
+
+def panel_other_marker(col, hinge_color, tol):
+    ms = marker_set(col, tol)
+    others = [m for m in ms if m != hinge_color]
+    return others[0] if others else None
+
+def panel_normal_from_hinge_and_other(col, hinge_color, tol):
+    hc, ha = marker_center_axis(col, hinge_color, tol)
+    if hc is None or ha is None:
+        return None
+    other = panel_other_marker(col, hinge_color, tol)
+    if not other:
+        return None
+    oc, _ = marker_center_axis(col, other, tol)
+    if oc is None:
+        return None
+    v = oc - hc
+    v = project_perp(v, ha)
+    if v.length < 1e-8:
+        return None
+    v = snap_axis_to_world(v)
+    n = ha.cross(v)
+    if n.length < 1e-8:
+        n = v.cross(ha)
+    if n.length < 1e-8:
+        return None
+    return snap_axis_to_world(n)
+
+def best_twist_angle_around_axis(from_vec: Vector, to_vec: Vector, axis: Vector):
+    axis = snap_axis_to_world(axis)
+    candidates = [0.0, 90.0, 180.0, 270.0]
+    best_a = 0.0
+    best_dot = -1e9
+    for ang in candidates:
+        R = Matrix.Rotation(math.radians(ang), 3, axis)
+        v2 = (R @ from_vec).normalized()
+        d = v2.dot(to_vec.normalized())
+        if d > best_dot:
+            best_dot = d
+            best_a = ang
+    return best_a
+
+# --------------------------------------------------------------------------------------
+# Transform helpers
+# --------------------------------------------------------------------------------------
+
+def translate_collection(col, delta):
+    M = Matrix.Translation(delta)
+    for o in collection_all_objects(col):
+        o.matrix_world = M @ o.matrix_world
+
+def apply_scale_to_collection_once(col, factor):
+    if not col or factor is None:
+        return
+    factor = float(factor)
+    if abs(factor - 1.0) < 1e-12:
+        return
+
+    prev = col.get("EB_SCALE_FACTOR", None)
+    if prev is not None:
+        prev = float(prev)
+        if abs(prev - factor) < 1e-12:
+            return
+        ratio = factor / prev if abs(prev) > 1e-12 else factor
+    else:
+        ratio = factor
+
+    pivot = get_collection_center(col)
+    S = Matrix.Scale(ratio, 4)
+    M = Matrix.Translation(pivot) @ S @ Matrix.Translation(-pivot)
+    for o in collection_all_objects(col):
+        o.matrix_world = M @ o.matrix_world
+
+    col["EB_SCALE_FACTOR"] = factor
+
+# --------------------------------------------------------------------------------------
+# Role detection
+# --------------------------------------------------------------------------------------
+
+ROLE_FRONT = "FRONT"  # {RED, BLUE}
+ROLE_RIGHT = "RIGHT"  # {RED, GREEN}
+ROLE_LEFT  = "LEFT"   # {BLUE, YELLOW}
+ROLE_BACK  = "BACK"   # {GREEN, YELLOW}
+ROLE_TOP   = "TOP"    # {CYAN, PINK}
+
+def detect_role_for_collection(col, tol):
+    found = marker_set(col, tol)
+    if found == {"RED", "BLUE"}: return ROLE_FRONT
+    if found == {"RED", "GREEN"}: return ROLE_RIGHT
+    if found == {"BLUE", "YELLOW"}: return ROLE_LEFT
+    if found == {"GREEN", "YELLOW"}: return ROLE_BACK
+    if found == {"CYAN", "PINK"}: return ROLE_TOP
+    return None
+
+def autodetect_panels(scene, tol):
+    roles = {}
+    for col in find_candidate_collections(scene):
+        role = detect_role_for_collection(col, tol)
+        if role:
+            roles.setdefault(role, col)
+    return roles
+
+# --------------------------------------------------------------------------------------
+# Mesh conversion + robust fill (per connected component)
+# --------------------------------------------------------------------------------------
+
+def ensure_curve_filled(curve_obj):
+    try:
+        curve_obj.data.dimensions = "2D"
+        curve_obj.data.fill_mode = "BOTH"
+    except Exception:
+        pass
+
+def convert_obj_to_mesh_inplace(obj):
+    if obj.type == "MESH":
+        return obj
+    if obj.type != "CURVE":
+        return None
+    ensure_curve_filled(obj)
+    ensure_object_mode()
+    deselect_all()
+    obj.select_set(True)
+    set_active(obj)
+    bpy.ops.object.convert(target="MESH")
+    return obj if obj.type == "MESH" else None
+
+def _connected_edge_components(bm):
+    v_to_edges = {v: [] for v in bm.verts}
+    for e in bm.edges:
+        v_to_edges[e.verts[0]].append(e)
+        v_to_edges[e.verts[1]].append(e)
+
+    visited_v = set()
+    comps = []
+
+    for v in bm.verts:
+        if v in visited_v:
+            continue
+        if not v_to_edges.get(v):
+            visited_v.add(v)
+            continue
+
+        stack = [v]
+        visited_v.add(v)
+        comp_verts = set([v])
+
+        while stack:
+            cur = stack.pop()
+            for e in v_to_edges.get(cur, []):
+                for nv in e.verts:
+                    if nv not in visited_v:
+                        visited_v.add(nv)
+                        stack.append(nv)
+                        comp_verts.add(nv)
+
+        comp_edges = []
+        for e in bm.edges:
+            if e.verts[0] in comp_verts and e.verts[1] in comp_verts:
+                comp_edges.append(e)
+        if comp_edges:
+            comps.append(comp_edges)
+
+    return comps
+
+def try_fill_mesh_faces(obj):
+    if not obj or obj.type != "MESH":
+        return
+    me = obj.data
+    if len(me.polygons) > 0:
+        return
+
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    comps = _connected_edge_components(bm)
+    if not comps:
+        bm.free()
+        return
+
+    for edges in comps:
+        try:
+            bmesh.ops.edgenet_fill(bm, edges=edges)
+        except Exception:
+            pass
+
+    bm.normal_update()
+    bm.to_mesh(me)
+    bm.free()
+
+def apply_transforms(obj):
+    ensure_object_mode()
+    deselect_all()
+    obj.select_set(True)
+    set_active(obj)
+    try:
+        bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+    except Exception:
+        pass
+
+def solidify(obj, thickness, pre_merge=0.0):
+    # mild cleanup pre-solidify (optionally)
+    clean_mesh_geometry(obj, merge_dist=pre_merge)
+
+    mod = obj.modifiers.new("EB_SOLIDIFY", "SOLIDIFY")
+    mod.thickness = float(thickness)
+    mod.offset = 0.0
+    if hasattr(mod, "use_even_offset"):
+        mod.use_even_offset = True
+    if hasattr(mod, "use_rim"):
+        mod.use_rim = True
+
+    ensure_object_mode()
+    deselect_all()
+    obj.select_set(True)
+    set_active(obj)
+    bpy.ops.object.modifier_apply(modifier=mod.name)
+
+    apply_transforms(obj)
+    # DO NOT aggressively merge after solidify; just normals/loose
+    clean_mesh_geometry(obj, merge_dist=0.0)
+
+# --------------------------------------------------------------------------------------
+# Boolean helpers (with cutter padding)
+# --------------------------------------------------------------------------------------
+
+def apply_boolean(base, cutter, op):
+    mod = base.modifiers.new(name=f"EB_BOOL_{op}_{cutter.name}", type="BOOLEAN")
+    mod.operation = op
+    mod.object = cutter
+    if hasattr(mod, "solver"):
+        mod.solver = "EXACT"
+    # these exist in some blender versions; guard them
+    if hasattr(mod, "use_self"):
+        mod.use_self = True
+    if hasattr(mod, "use_hole_tolerant"):
+        mod.use_hole_tolerant = True
+
+    ensure_object_mode()
+    deselect_all()
+    base.select_set(True)
+    set_active(base)
+    try:
+        bpy.ops.object.modifier_apply(modifier=mod.name)
+        return True
+    except Exception as e:
+        print(f"Boolean failed ({op}) with {cutter.name}: {e}")
+        return False
+
+def duplicate_object_to_work(o, work_col):
+    dup = o.copy()
+    dup.data = o.data.copy()
+    dup.matrix_world = o.matrix_world.copy()
+    work_col.objects.link(dup)
+    return dup
+
+def object_bbox_diag_world(obj):
+    pts = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+    mn = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+    mx = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+    return (mx - mn).length
+
+def padded_cutter_copy(cutter, work_col, padding_abs):
+    """
+    Make a padded copy of cutter by scaling uniformly around its center.
+    padding_abs is in world units (same as your model).
+    """
+    dup = cutter.copy()
+    dup.data = cutter.data.copy()
+    dup.matrix_world = cutter.matrix_world.copy()
+    work_col.objects.link(dup)
+
+    # scale factor based on bbox diagonal
+    diag = max(1e-9, object_bbox_diag_world(dup))
+    s = 1.0 + (float(padding_abs) / diag)
+
+    pivot = dup.matrix_world.translation.copy()
+    M = Matrix.Translation(pivot) @ Matrix.Scale(s, 4) @ Matrix.Translation(-pivot)
+    dup.matrix_world = M @ dup.matrix_world
+
+    apply_transforms(dup)
+    return dup
+
+# --------------------------------------------------------------------------------------
+# Volume build
+# --------------------------------------------------------------------------------------
+
+def build_volume_from_objects(objs, name, thickness, pre_merge=0.0):
+    """
+    Converts each object -> fills per component -> solidify individually -> boolean UNION into one volume.
+    Returns a single mesh object or None.
+    """
+    meshes = []
+    for o in objs:
+        if o.type == "CURVE":
+            m = convert_obj_to_mesh_inplace(o)
+        elif o.type == "MESH":
+            m = o
+        else:
+            m = None
+        if not m:
+            continue
+        try_fill_mesh_faces(m)
+        if m.type == "MESH" and len(m.data.polygons) > 0:
+            meshes.append(m)
+
+    if not meshes:
+        return None
+
+    for m in meshes:
+        solidify(m, thickness, pre_merge=pre_merge)
+
+    base = meshes[0]
+    base.name = name
+    apply_transforms(base)
+
+    for m in meshes[1:]:
+        apply_transforms(m)
+        apply_boolean(base, m, op="UNION")
+        try:
+            bpy.data.objects.remove(m, do_unlink=True)
+        except Exception:
+            pass
+
+    # do NOT merge-by-distance here; just normals/loose
+    clean_mesh_geometry(base, merge_dist=0.0)
+    return base
+
+def build_intersection_across_roles(role_to_objs, name, thickness, pre_merge=0.0):
+    """
+    For a group/subgroup:
+      - build unioned volume per role
+      - INTERSECT across roles that exist
+    """
+    role_vols = []
+    for role, objs in role_to_objs.items():
+        if not objs:
+            continue
+        v = build_volume_from_objects(objs, f"{name}_{role}_VOL", thickness, pre_merge=pre_merge)
+        if v:
+            role_vols.append(v)
+
+    if not role_vols:
+        return None
+
+    inter = role_vols[0]
+    inter.name = name
+    for v in role_vols[1:]:
+        apply_transforms(inter)
+        apply_transforms(v)
+        apply_boolean(inter, v, op="INTERSECT")
+        try:
+            bpy.data.objects.remove(v, do_unlink=True)
+        except Exception:
+            pass
+
+    clean_mesh_geometry(inter, merge_dist=0.0)
+    return inter
+
+# --------------------------------------------------------------------------------------
+# Top Work Plane (for drawing on top)
+# --------------------------------------------------------------------------------------
+
+def world_bbox(obj):
+    pts = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+    mn = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+    mx = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+    return mn, mx
+
+def create_or_update_top_plane(outc, target_obj, margin=200.0, z_offset=0.0, wire=True):
+    if not target_obj or target_obj.type != "MESH":
+        return None
+
+    mn, mx = world_bbox(target_obj)
+
+    cx = (mn.x + mx.x) * 0.5
+    cy = (mn.y + mx.y) * 0.5
+    z  = mx.z + float(z_offset)
+
+    sx = (mx.x - mn.x) + 2.0 * float(margin)
+    sy = (mx.y - mn.y) + 2.0 * float(margin)
+
+    old = bpy.data.objects.get("EB_TopPlane")
+    if old:
+        try:
+            bpy.data.objects.remove(old, do_unlink=True)
+        except Exception:
+            pass
+
+    me = bpy.data.meshes.new("EB_TopPlaneMesh")
+    obj = bpy.data.objects.new("EB_TopPlane", me)
+
+    try:
+        outc.objects.link(obj)
+    except Exception:
+        bpy.context.scene.collection.objects.link(obj)
+
+    hx = sx * 0.5
+    hy = sy * 0.5
+    verts = [
+        (cx - hx, cy - hy, z),
+        (cx + hx, cy - hy, z),
+        (cx + hx, cy + hy, z),
+        (cx - hx, cy + hy, z),
+    ]
+    faces = [(0, 1, 2, 3)]
+    me.from_pydata(verts, [], faces)
+    me.update()
+
+    obj.display_type = "WIRE" if wire else "SOLID"
+    obj.hide_render = True
+    obj.show_in_front = True
+    return obj
+
+# --------------------------------------------------------------------------------------
+# Alignment
+# --------------------------------------------------------------------------------------
+
+def align_child_to_parent_hinge(
+    child_col,
+    parent_col,
+    hinge_color,
+    tol,
+    fold_deg,
+    avoid_center=None,
+    target_marker_color=None,
+    target_marker_point=None,
+):
+    p_hc, p_ha = marker_center_axis(parent_col, hinge_color, tol)
+    c_hc, c_ha = marker_center_axis(child_col,  hinge_color, tol)
+    if p_hc is None or c_hc is None:
+        return False
+
+    translate_collection(child_col, (p_hc - c_hc))
+
+    p_hc, p_ha = marker_center_axis(parent_col, hinge_color, tol)
+    c_hc, c_ha = marker_center_axis(child_col,  hinge_color, tol)
+    if p_ha is None or c_ha is None:
+        return False
+
+    rot_axis, rot_deg = axis_angle_to_map_world_axes(c_ha, p_ha)
+    if abs(rot_deg) > 1e-6:
+        rotate_collection_around_axis(child_col, p_hc, rot_axis, rot_deg)
+
+    p_n = panel_normal_from_hinge_and_other(parent_col, hinge_color, tol)
+    c_n = panel_normal_from_hinge_and_other(child_col,  hinge_color, tol)
+    if p_n and c_n:
+        hinge_axis = snap_axis_to_world(p_ha)
+        twist = best_twist_angle_around_axis(c_n, p_n, hinge_axis)
+        if abs(twist) > 1e-6:
+            rotate_collection_around_axis(child_col, p_hc, hinge_axis, twist)
+
+    fold_deg = snap_to_90_deg(fold_deg)
+    hinge_axis = snap_axis_to_world(p_ha)
+    final_fold = fold_deg
+
+    if target_marker_color and target_marker_point and abs(fold_deg) > 1e-6:
+        cm, _ = marker_center_axis(child_col, target_marker_color, tol)
+        if cm is not None:
+            pos = simulate_rotate_point(cm, p_hc, hinge_axis, +abs(fold_deg))
+            neg = simulate_rotate_point(cm, p_hc, hinge_axis, -abs(fold_deg))
+            dpos = (pos - target_marker_point).length
+            dneg = (neg - target_marker_point).length
+            final_fold = (+abs(fold_deg)) if (dpos <= dneg) else (-abs(fold_deg))
+    elif avoid_center and abs(fold_deg) > 1e-6:
+        curr_center = get_collection_center(child_col)
+        pos_center = simulate_rotate_point(curr_center, p_hc, hinge_axis, +abs(fold_deg))
+        neg_center = simulate_rotate_point(curr_center, p_hc, hinge_axis, -abs(fold_deg))
+        dist_pos = (pos_center - avoid_center).length
+        dist_neg = (neg_center - avoid_center).length
+        final_fold = (-abs(fold_deg)) if (dist_neg > dist_pos) else (+abs(fold_deg))
+
+    if abs(final_fold) > 1e-6:
+        rotate_collection_around_axis(child_col, p_hc, hinge_axis, final_fold)
+
+    return True
+
+# --------------------------------------------------------------------------------------
+# Name parsing: on/off/cut groups
+# --------------------------------------------------------------------------------------
+
+_TAG_RE = re.compile(r'^(on|off|cut)-(\d+)(?:-(\d+))?(?:-\d+)?(?:\.\d+)?$', re.IGNORECASE)
+
+def parse_tag(name: str):
+    if not name:
+        return None, None, None
+    n = name.strip()
+    m = _TAG_RE.match(n)
+    if not m:
+        return None, None, None
+    tag = m.group(1).upper()
+    gid = m.group(2)
+    sid = m.group(3)
+    if tag in {"OFF", "CUT"} and sid is None:
+        sid = "0"
+    return tag, gid, sid
+
+# --------------------------------------------------------------------------------------
+# Scene collections helper
+# --------------------------------------------------------------------------------------
+
+def get_or_create_collection(name, parent=None):
+    col = bpy.data.collections.get(name)
+    if not col:
+        col = bpy.data.collections.new(name)
+        if parent:
+            parent.children.link(col)
+        else:
+            bpy.context.scene.collection.children.link(col)
+    return col
+
+def clear_collection_objects(col):
+    for o in list(col.objects):
+        bpy.data.objects.remove(o, do_unlink=True)
+
+# --------------------------------------------------------------------------------------
+# Settings
+# --------------------------------------------------------------------------------------
+
+class EB_Settings(PropertyGroup):
+    auto_detect: BoolProperty(
+        name="Auto-detect panels by marker pair",
+        default=True,
+        description="FRONT=R+B, RIGHT=R+G, LEFT=B+Y, BACK=G+Y, TOP=C+P",
+    )
+
+    front_col: PointerProperty(name="Front Override (R+B)", type=bpy.types.Collection)
+    right_col: PointerProperty(name="Right Override (R+G)", type=bpy.types.Collection)
+    left_col:  PointerProperty(name="Left Override (B+Y)",  type=bpy.types.Collection)
+    back_col:  PointerProperty(name="Back Override (G+Y)",  type=bpy.types.Collection)
+    top_col:   PointerProperty(name="Top Override (C+P)",   type=bpy.types.Collection)
+
+    marker_tol: FloatProperty(name="Marker Color Tol", default=0.10, min=0.0, max=0.5)
+
+    black_tol: FloatProperty(name="Black Tol", default=0.12, min=0.0, max=0.5)
+    grey_eq_tol: FloatProperty(name="Grey Eq Tol", default=0.10, min=0.0, max=0.5)
+    grey_min: FloatProperty(name="Grey Min", default=0.15, min=0.0, max=1.0)
+    grey_max: FloatProperty(name="Grey Max", default=0.85, min=0.0, max=1.0)
+
+    apply_svg_scale_on_align: BoolProperty(
+        name="Apply SVG scale on Align",
+        default=True,
+        description="Applies a scale factor to imported SVG panels once, before folding/alignment."
+    )
+    svg_to_world_scale: FloatProperty(
+        name="SVG→World Scale",
+        default=0.1,
+        min=0.000001,
+        max=100000.0,
+        description="Typical A4/A3 at 1:100 when imported in mm-units => 0.1 (1mm -> 0.1m)."
+    )
+
+    stand_up: BoolProperty(
+        name="Stand Up (+90° X) if flat",
+        default=True,
+        description="Only stands a panel up if markers are all at ~same Z (prevents double stand-up).",
+    )
+
+    fold_deg: FloatProperty(
+        name="Fold Angle (snaps to 90°)",
+        default=90.0,
+        min=-360.0,
+        max=360.0,
+    )
+
+    solidify_thickness: FloatProperty(
+        name="Extrude Thickness",
+        default=500.0,
+        min=0.001,
+        max=100000.0,
+    )
+
+    # Boolean robustness
+    use_cutter_padding: BoolProperty(
+        name="Use Cutter Padding",
+        default=True,
+        description="Slightly expands cutters before booleans to avoid coplanar faces -> fewer dents."
+    )
+    cutter_padding: FloatProperty(
+        name="Cutter Padding",
+        default=0.5,
+        min=0.0,
+        max=10000.0,
+        description="World units. Small value like 0.1–1.0 (depending on your scale)."
+    )
+
+    # pre-merge only before solidify (rarely needed)
+    pre_solidify_merge_dist: FloatProperty(
+        name="Pre-Solidify Merge Dist",
+        default=0.0,
+        min=0.0,
+        max=10.0,
+        description="Optional small merge before solidify (usually keep 0)."
+    )
+
+    keep_intermediate: BoolProperty(name="Keep Intermediate", default=False)
+
+    # Top plane settings
+    create_top_plane: BoolProperty(
+        name="Create Top Plane",
+        default=True,
+        description="Create a work plane at the top of the tallest output mesh.",
+    )
+    top_plane_margin: FloatProperty(
+        name="Top Plane Margin",
+        default=200.0,
+        min=0.0,
+        max=10000.0,
+        description="Extra margin around the mesh bounding box for the top plane.",
+    )
+    top_plane_z_offset: FloatProperty(
+        name="Top Plane Z Offset",
+        default=0.0,
+        min=-10000.0,
+        max=10000.0,
+        description="Vertical offset from the top of the mesh.",
+    )
+    top_plane_wire: BoolProperty(
+        name="Top Plane Wireframe",
+        default=True,
+        description="Display top plane as wireframe (vs solid).",
+    )
+
+def resolve_panels(context):
+    s = context.scene.eb_settings
+    roles = {}
+    if s.auto_detect:
+        roles = autodetect_panels(context.scene, s.marker_tol)
+
+    if s.front_col: roles[ROLE_FRONT] = s.front_col
+    if s.right_col: roles[ROLE_RIGHT] = s.right_col
+    if s.left_col:  roles[ROLE_LEFT]  = s.left_col
+    if s.back_col:  roles[ROLE_BACK]  = s.back_col
+    if s.top_col:   roles[ROLE_TOP]   = s.top_col
+
+    return roles
+
+# --------------------------------------------------------------------------------------
+# Operators
+# --------------------------------------------------------------------------------------
+
+class EB_OT_align(Operator):
+    bl_idname = "eb.align_panels"
+    bl_label = "Align (fold available panels)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        ensure_object_mode()
+        s = context.scene.eb_settings
+        roles = resolve_panels(context)
+
+        if not roles:
+            self.report({"ERROR"}, "No panels detected. Each panel collection must contain exactly two marker colors.")
+            return {"CANCELLED"}
+
+        if s.apply_svg_scale_on_align:
+            for col in {c for c in roles.values() if c}:
+                apply_scale_to_collection_once(col, s.svg_to_world_scale)
+
+        front = roles.get(ROLE_FRONT, None)
+        right = roles.get(ROLE_RIGHT, None)
+        left  = roles.get(ROLE_LEFT,  None)
+        back  = roles.get(ROLE_BACK,  None)
+
+        if s.stand_up:
+            for col in {c for c in [front, right, left, back] if c}:
+                if should_stand_up(col, s.marker_tol):
+                    stand_up_collection(col, s.marker_tol)
+
+        fold = abs(snap_to_90_deg(s.fold_deg))
+        warnings = []
+        did_any = False
+
+        front_center = get_collection_center(front) if front else None
+
+        if front and right:
+            ok = align_child_to_parent_hinge(right, front, "RED", s.marker_tol, +fold)
+            did_any = did_any or ok
+            if not ok: warnings.append("FRONT+RIGHT (RED hinge) failed")
+
+        if front and left:
+            ok = align_child_to_parent_hinge(left, front, "BLUE", s.marker_tol, -fold)
+            did_any = did_any or ok
+            if not ok: warnings.append("FRONT+LEFT (BLUE hinge) failed")
+
+        if back and right:
+            target_point = None
+            if left:
+                target_point, _ = marker_center_axis(left, "YELLOW", s.marker_tol)
+            ok = align_child_to_parent_hinge(
+                back, right, "GREEN", s.marker_tol, +fold,
+                avoid_center=front_center,
+                target_marker_color="YELLOW",
+                target_marker_point=target_point
+            )
+            did_any = did_any or ok
+            if not ok: warnings.append("RIGHT+BACK (GREEN hinge) failed")
+
+        elif back and left:
+            target_point = None
+            if right:
+                target_point, _ = marker_center_axis(right, "GREEN", s.marker_tol)
+            ok = align_child_to_parent_hinge(
+                back, left, "YELLOW", s.marker_tol, -fold,
+                avoid_center=front_center,
+                target_marker_color="GREEN",
+                target_marker_point=target_point
+            )
+            did_any = did_any or ok
+            if not ok: warnings.append("LEFT+BACK (YELLOW hinge) failed")
+
+        present_roles = [r for r, c in roles.items() if c]
+        if len(present_roles) == 2 and not did_any:
+            warnings.append("Two panels found but no adjacent hinge matched (need a shared marker color).")
+
+        if warnings:
+            self.report({"WARNING"}, " | ".join(warnings))
+
+        self.report({"INFO"}, f"Align done. Panels present: {', '.join(present_roles)}")
+        return {"FINISHED"}
+
+class EB_OT_create_mesh_parts(Operator):
+    bl_idname = "eb.create_mesh_parts"
+    bl_label = "Create Mesh Parts (No Merge)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        ensure_object_mode()
+        s = context.scene.eb_settings
+        roles = resolve_panels(context)
+        if not roles:
+            self.report({"ERROR"}, "No panels detected (need marker pairs).")
+            return {"CANCELLED"}
+
+        panels = [(r, c) for r, c in roles.items() if c and r != ROLE_TOP]  # TOP ignored for mesh build
+        if not panels:
+            self.report({"ERROR"}, "No valid side panel collections resolved.")
+            return {"CANCELLED"}
+
+        root = get_or_create_collection("EB_Builder")
+        work = get_or_create_collection("EB_Work", parent=root)
+        outc = get_or_create_collection("EB_Output", parent=root)
+
+        clear_collection_objects(work)
+        if not s.keep_intermediate:
+            clear_collection_objects(outc)
+
+        black_by_role = {r: [] for r, _ in panels}
+        grey_by_role  = {r: [] for r, _ in panels}
+
+        on_groups = {}
+        off_groups = {}
+
+        for role, src_col in panels:
+            for o in collection_all_objects(src_col):
+                if o.type not in {"CURVE","MESH"}:
+                    continue
+
+                is_marker = any(obj_any_material_matches(o, color_predicate(m, s.marker_tol)) for m in MARKERS)
+                if is_marker:
+                    continue
+
+                rgb = get_obj_primary_color(o)
+                tag, gid, sid = parse_tag(o.name)
+
+                if tag in {"ON", "OFF", "CUT"}:
+                    dup = duplicate_object_to_work(o, work)
+                    if tag == "ON":
+                        on_groups.setdefault(gid, {}).setdefault(role, []).append(dup)
+                    else:
+                        off_groups.setdefault(gid, {}).setdefault(sid, {}).setdefault(role, []).append(dup)
+                    continue
+
+                if rgb and is_black(rgb, s.black_tol):
+                    dup = duplicate_object_to_work(o, work)
+                    black_by_role[role].append(dup)
+                    continue
+
+                if rgb and is_grey(rgb, s.grey_eq_tol, s.grey_min, s.grey_max):
+                    dup = duplicate_object_to_work(o, work)
+                    grey_by_role[role].append(dup)
+                    continue
+
+        created_parts = []
+
+        # Optional: base black as its own part
+        base_black = build_intersection_across_roles(
+            {role: black_by_role.get(role, []) for role, _ in panels},
+            "EB_Base_BLACK",
+            s.solidify_thickness,
+            pre_merge=s.pre_solidify_merge_dist
+        )
+        if base_black:
+            outc.objects.link(base_black)
+            try:
+                work.objects.unlink(base_black)
+            except Exception:
+                pass
+            base_black.name = "EB_Base_BLACK"
+            created_parts.append(base_black)
+
+            # subtract grey (using padding if enabled)
+            base_grey = build_intersection_across_roles(
+                {role: grey_by_role.get(role, []) for role, _ in panels},
+                "EB_Base_GREY",
+                s.solidify_thickness,
+                pre_merge=s.pre_solidify_merge_dist
+            )
+            if base_grey:
+                cutter_obj = base_grey
+                if s.use_cutter_padding and s.cutter_padding > 0.0:
+                    cutter_obj = padded_cutter_copy(base_grey, work, s.cutter_padding)
+
+                apply_transforms(base_black)
+                apply_transforms(cutter_obj)
+                apply_boolean(base_black, cutter_obj, op="DIFFERENCE")
+
+                # cleanup
+                clean_mesh_geometry(base_black, merge_dist=0.0)
+
+                # delete cutters
+                try:
+                    bpy.data.objects.remove(base_grey, do_unlink=True)
+                except Exception:
+                    pass
+                if cutter_obj != base_grey:
+                    try:
+                        bpy.data.objects.remove(cutter_obj, do_unlink=True)
+                    except Exception:
+                        pass
+
+        # ON groups -> create independent parts (NO UNION into one)
+        for gid, rolemap in sorted(on_groups.items(), key=lambda x: int(x[0]) if x[0].isdigit() else x[0]):
+            on_vol = build_intersection_across_roles(
+                rolemap,
+                f"EB_Part_ON_{gid}",
+                s.solidify_thickness,
+                pre_merge=s.pre_solidify_merge_dist
+            )
+            if not on_vol:
+                continue
+
+            # subtract OFF for this gid
+            if gid in off_groups:
+                for sid, off_rolemap in sorted(off_groups[gid].items(), key=lambda x: int(x[0]) if x[0].isdigit() else x[0]):
+                    off_vol = build_intersection_across_roles(
+                        off_rolemap,
+                        f"EB_OFF_{gid}_{sid}",
+                        s.solidify_thickness,
+                        pre_merge=s.pre_solidify_merge_dist
+                    )
+                    if not off_vol:
+                        continue
+
+                    cutter_obj = off_vol
+                    if s.use_cutter_padding and s.cutter_padding > 0.0:
+                        cutter_obj = padded_cutter_copy(off_vol, work, s.cutter_padding)
+
+                    apply_transforms(on_vol)
+                    apply_transforms(cutter_obj)
+                    bool_ok = apply_boolean(on_vol, cutter_obj, op="DIFFERENCE")
+                    clean_mesh_geometry(on_vol, merge_dist=0.0)
+
+                    # delete cutters
+                    try:
+                        bpy.data.objects.remove(off_vol, do_unlink=True)
+                    except Exception:
+                        pass
+                    if cutter_obj != off_vol:
+                        try:
+                            bpy.data.objects.remove(cutter_obj, do_unlink=True)
+                        except Exception:
+                            pass
+
+            # link part to output
+            outc.objects.link(on_vol)
+            try:
+                work.objects.unlink(on_vol)
+            except Exception:
+                pass
+
+            on_vol.name = f"EB_Part_ON_{gid}"
+            created_parts.append(on_vol)
+
+        if not created_parts:
+            self.report({"ERROR"}, "No parts created. Need BLACK base shapes or at least one on-<gid> group.")
+            return {"CANCELLED"}
+
+        # Top plane: place at top of the tallest part
+        top_plane = None
+        if s.create_top_plane:
+            tallest = max(created_parts, key=lambda o: world_bbox(o)[1].z if o.type == "MESH" else -1e9)
+            top_plane = create_or_update_top_plane(
+                outc,
+                tallest,
+                margin=s.top_plane_margin,
+                z_offset=s.top_plane_z_offset,
+                wire=s.top_plane_wire
+            )
+
+        # cleanup work objects if desired
+        if not s.keep_intermediate:
+            for o in list(work.objects):
+                try:
+                    bpy.data.objects.remove(o, do_unlink=True)
+                except Exception:
+                    pass
+
+        msg = f"Created {len(created_parts)} part(s) in EB_Output"
+        if top_plane:
+            msg += " + EB_TopPlane"
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+# --------------------------------------------------------------------------------------
+# UI Panel
+# --------------------------------------------------------------------------------------
+
+class EB_PT_panel(Panel):
+    bl_label = "Elevation Builder"
+    bl_idname = "EB_PT_panel"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Elevation Builder"
+
+    def draw(self, context):
+        s = context.scene.eb_settings
+        layout = self.layout
+
+        layout.label(text="Detection (marker pairs)")
+        layout.prop(s, "auto_detect")
+        layout.prop(s, "marker_tol")
+
+        box = layout.box()
+        box.label(text="Optional manual overrides")
+        box.prop(s, "front_col")
+        box.prop(s, "right_col")
+        box.prop(s, "left_col")
+        box.prop(s, "back_col")
+        box.prop(s, "top_col")
+
+        layout.separator()
+        layout.label(text="Scaling")
+        layout.prop(s, "apply_svg_scale_on_align")
+        layout.prop(s, "svg_to_world_scale")
+
+        layout.separator()
+        layout.label(text="Align")
+        layout.prop(s, "stand_up")
+        layout.prop(s, "fold_deg")
+        layout.operator("eb.align_panels", icon="ORIENTATION_GLOBAL")
+
+        layout.separator()
+        layout.label(text="Create Mesh (No-Merge Parts)")
+        layout.prop(s, "solidify_thickness")
+        layout.prop(s, "black_tol")
+        layout.prop(s, "grey_eq_tol")
+        row = layout.row(align=True)
+        row.prop(s, "grey_min")
+        row.prop(s, "grey_max")
+
+        box = layout.box()
+        box.label(text="Boolean robustness")
+        box.prop(s, "use_cutter_padding")
+        if s.use_cutter_padding:
+            box.prop(s, "cutter_padding")
+        box.prop(s, "pre_solidify_merge_dist")
+
+        layout.prop(s, "keep_intermediate")
+        layout.operator("eb.create_mesh_parts", icon="MOD_BOOLEAN")
+
+        layout.separator()
+        layout.label(text="Top Work Plane")
+        layout.prop(s, "create_top_plane")
+        if s.create_top_plane:
+            box = layout.box()
+            box.prop(s, "top_plane_margin")
+            box.prop(s, "top_plane_z_offset")
+            box.prop(s, "top_plane_wire")
+
+# --------------------------------------------------------------------------------------
+# Register
+# --------------------------------------------------------------------------------------
+
+classes = (
+    EB_Settings,
+    EB_OT_align,
+    EB_OT_create_mesh_parts,
+    EB_PT_panel,
+)
+
+def register():
+    if hasattr(bpy.types.Scene, "eb_settings"):
+        try:
+            del bpy.types.Scene.eb_settings
+        except Exception:
+            pass
+    for c in classes:
+        bpy.utils.register_class(c)
+    bpy.types.Scene.eb_settings = PointerProperty(type=EB_Settings)
+
+def unregister():
+    if hasattr(bpy.types.Scene, "eb_settings"):
+        del bpy.types.Scene.eb_settings
+    for c in reversed(classes):
+        bpy.utils.unregister_class(c)
+
+if __name__ == "__main__":
+    register()
