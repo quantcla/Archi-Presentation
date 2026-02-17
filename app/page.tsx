@@ -2752,34 +2752,66 @@ const SimulationViewer = ({
         pdfFilename: null,
       };
 
-      // Upload files one at a time to avoid Vercel body size limit (4.5MB)
+      // Helper: convert data URL to Blob
+      const dataUrlToBlob = (dataUrl: string): Blob => {
+        const [header, base64] = dataUrl.split(',');
+        const mime = header.match(/:(.*?);/)?.[1] || 'image/png';
+        const binary = atob(base64);
+        const array = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) array[i] = binary.charCodeAt(i);
+        return new Blob([array], { type: mime });
+      };
+
+      // Helper: upload a single file
+      const uploadFile = async (path: string, file: Blob | File, filename?: string): Promise<string | null> => {
+        const fd = new FormData();
+        fd.append('action', 'upload-file');
+        fd.append('path', path);
+        fd.append('file', file, filename || 'file');
+        const res = await fetch('/api/share', { method: 'POST', body: fd });
+        const json = await res.json();
+        return json.url || null;
+      };
+
+      // Upload GLB models one at a time
       for (const model of sharedModels) {
         const blob = modelBlobs.get(model.id);
         if (blob) {
-          const fd = new FormData();
-          fd.append('action', 'upload-file');
-          fd.append('path', `presentations/${shareId}/${model.glbFilename}`);
-          fd.append('file', blob, model.glbFilename);
-          const res = await fetch('/api/share', { method: 'POST', body: fd });
-          const json = await res.json();
-          if (json.url) model.glbUrl = json.url;
+          const url = await uploadFile(`presentations/${shareId}/${model.glbFilename}`, blob, model.glbFilename);
+          if (url) model.glbUrl = url;
         }
       }
 
+      // Upload hotspot images (linkedImage + linked360Image) as separate files
+      for (const slide of metadata.slides) {
+        for (const hotspot of slide.hotspots) {
+          if (hotspot.linkedImage && hotspot.linkedImage.startsWith('data:')) {
+            const imgBlob = dataUrlToBlob(hotspot.linkedImage);
+            const ext = hotspot.linkedImage.includes('image/png') ? 'png' : 'jpg';
+            const filename = `hotspot_${hotspot.id}_img.${ext}`;
+            const url = await uploadFile(`presentations/${shareId}/${filename}`, imgBlob, filename);
+            if (url) hotspot.linkedImage = url;
+          }
+          if (hotspot.linked360Image && hotspot.linked360Image.startsWith('data:')) {
+            const imgBlob = dataUrlToBlob(hotspot.linked360Image);
+            const ext = hotspot.linked360Image.includes('image/png') ? 'png' : 'jpg';
+            const filename = `hotspot_${hotspot.id}_360.${ext}`;
+            const url = await uploadFile(`presentations/${shareId}/${filename}`, imgBlob, filename);
+            if (url) hotspot.linked360Image = url;
+          }
+        }
+      }
+
+      // Upload PDF
       if (sharePdf) {
-        const fd = new FormData();
-        fd.append('action', 'upload-file');
-        fd.append('path', `presentations/${shareId}/attachment.pdf`);
-        fd.append('file', sharePdf);
-        const res = await fetch('/api/share', { method: 'POST', body: fd });
-        const json = await res.json();
-        if (json.url) {
+        const url = await uploadFile(`presentations/${shareId}/attachment.pdf`, sharePdf, 'attachment.pdf');
+        if (url) {
           metadata.pdfFilename = 'attachment.pdf';
-          metadata.pdfUrl = json.url;
+          metadata.pdfUrl = url;
         }
       }
 
-      // Save metadata (small JSON)
+      // Save metadata (small JSON — all large files are now URLs)
       const metaFd = new FormData();
       metaFd.append('action', 'save-metadata');
       metaFd.append('metadata', JSON.stringify(metadata));
