@@ -2751,23 +2751,38 @@ const SimulationViewer = ({
         pdfFilename: null,
       };
 
-      // Build FormData
-      const formData = new FormData();
-      formData.append('metadata', JSON.stringify(metadata));
-
+      // Upload files one at a time to avoid Vercel body size limit (4.5MB)
       for (const model of sharedModels) {
         const blob = modelBlobs.get(model.id);
         if (blob) {
-          formData.append(`model_${model.id}`, blob, model.glbFilename);
+          const fd = new FormData();
+          fd.append('action', 'upload-file');
+          fd.append('path', `presentations/${shareId}/${model.glbFilename}`);
+          fd.append('file', blob, model.glbFilename);
+          const res = await fetch('/api/share', { method: 'POST', body: fd });
+          const json = await res.json();
+          if (json.url) model.glbUrl = json.url;
         }
       }
 
       if (sharePdf) {
-        formData.append('pdf', sharePdf);
+        const fd = new FormData();
+        fd.append('action', 'upload-file');
+        fd.append('path', `presentations/${shareId}/attachment.pdf`);
+        fd.append('file', sharePdf);
+        const res = await fetch('/api/share', { method: 'POST', body: fd });
+        const json = await res.json();
+        if (json.url) {
+          metadata.pdfFilename = 'attachment.pdf';
+          metadata.pdfUrl = json.url;
+        }
       }
 
-      // Upload
-      const response = await fetch('/api/share', { method: 'POST', body: formData });
+      // Save metadata (small JSON)
+      const metaFd = new FormData();
+      metaFd.append('action', 'save-metadata');
+      metaFd.append('metadata', JSON.stringify(metadata));
+      const response = await fetch('/api/share', { method: 'POST', body: metaFd });
       const result = await response.json();
 
       if (result.success) {
