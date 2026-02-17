@@ -2762,8 +2762,8 @@ const SimulationViewer = ({
         return new Blob([array], { type: mime });
       };
 
-      // Helper: upload a single file
-      const uploadFile = async (path: string, file: Blob | File, filename?: string): Promise<string | null> => {
+      // Helper: upload small file via server (< 4MB)
+      const uploadFileViaServer = async (path: string, file: Blob | File, filename?: string): Promise<string | null> => {
         const fd = new FormData();
         fd.append('action', 'upload-file');
         fd.append('path', path);
@@ -2771,6 +2771,30 @@ const SimulationViewer = ({
         const res = await fetch('/api/share', { method: 'POST', body: fd });
         const json = await res.json();
         return json.url || null;
+      };
+
+      // Helper: upload large file directly to Blob (no size limit)
+      const uploadFileDirect = async (path: string, file: Blob | File, filename?: string): Promise<string | null> => {
+        try {
+          const { upload } = await import('@vercel/blob/client');
+          const blob = await upload(path, file, {
+            access: 'public',
+            handleUploadUrl: '/api/share/upload-token',
+          });
+          return blob.url;
+        } catch {
+          // Fallback to server upload (local dev)
+          return uploadFileViaServer(path, file, filename);
+        }
+      };
+
+      // Smart upload: use direct for large files, server for small
+      const uploadFile = async (path: string, file: Blob | File, filename?: string): Promise<string | null> => {
+        if (file.size > 3.5 * 1024 * 1024) {
+          // > 3.5MB — upload directly to Blob
+          return uploadFileDirect(path, file, filename);
+        }
+        return uploadFileViaServer(path, file, filename);
       };
 
       // Upload GLB models one at a time
