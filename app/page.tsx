@@ -6227,8 +6227,8 @@ const SimulationViewer = ({
                   {skyEnabled && (
                     <div className="flex items-center gap-2 px-1">
                       <span className="text-[9px] text-gray-400">Ground</span>
-                      <input type="range" min="-10" max="10" step="0.5" value={groundLevel} onChange={(e) => setGroundLevel(parseFloat(e.target.value))} className="w-14 h-1 accent-green-500" />
-                      <span className="text-[9px] text-gray-500">{groundLevel.toFixed(1)}</span>
+                      <input type="range" min="-10" max="10" step="0.5" value={skyGroundLevel} onChange={(e) => setSkyGroundLevel(parseFloat(e.target.value))} className="w-14 h-1 accent-green-500" />
+                      <span className="text-[9px] text-gray-500">{skyGroundLevel.toFixed(1)}</span>
                     </div>
                   )}
                   <span className="text-[9px] text-gray-400 font-medium uppercase tracking-wider text-center mt-auto">Environment</span>
