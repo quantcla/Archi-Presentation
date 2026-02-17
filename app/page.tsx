@@ -6491,7 +6491,7 @@ const SimulationViewer = ({
                         ))}
                       </div>
                     </div>
-                    <button onClick={() => { if (camera && controls) { updateHotspot(editingHotspotId!, { savedView: { position: { x: camera.position.x, y: camera.position.y, z: camera.position.z }, target: { x: (controls as any).target.x, y: (controls as any).target.y, z: (controls as any).target.z } } }); } }} className="w-full px-2 py-1.5 rounded text-xs font-medium bg-gray-100 hover:bg-gray-200 text-gray-700">📷 Save Current View</button>
+                    <button onClick={() => { if (camera && controls) { updateHotspot(editingHotspotId!, { savedView: { position: new THREE.Vector3(camera.position.x, camera.position.y, camera.position.z), target: new THREE.Vector3((controls as any).target.x, (controls as any).target.y, (controls as any).target.z) } }); } }} className="w-full px-2 py-1.5 rounded text-xs font-medium bg-gray-100 hover:bg-gray-200 text-gray-700">📷 Save Current View</button>
                     {editingHotspot!.savedView && <span className="text-[10px] text-green-600">✓ View saved</span>}
                     {demolitionVolumes.length > 0 && (
                       <div>
