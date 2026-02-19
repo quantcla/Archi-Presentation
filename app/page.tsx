@@ -3877,13 +3877,8 @@ const SimulationViewer = ({
           const mat = child.material as THREE.MeshStandardMaterial | THREE.MeshBasicMaterial;
           const name = child.name || `Mesh_${parts.length}`;
 
-          // Try to detect element type from name
-          let elementType: 'wall' | 'floor' | 'door' | 'window' | 'other' = 'other';
-          const nameLower = name.toLowerCase();
-          if (nameLower.includes('wall') || nameLower.includes('wand')) elementType = 'wall';
-          else if (nameLower.includes('floor') || nameLower.includes('boden') || nameLower.includes('ground')) elementType = 'floor';
-          else if (nameLower.includes('door') || nameLower.includes('tür') || nameLower.includes('tur')) elementType = 'door';
-          else if (nameLower.includes('window') || nameLower.includes('fenster') || nameLower.includes('glass')) elementType = 'window';
+          // Element type defaults to 'other' — user assigns types manually via the render tab
+          const elementType: 'wall' | 'floor' | 'door' | 'window' | 'other' = 'other';
 
           const originalColor = mat.color ? mat.color.clone() : new THREE.Color(0xffffff);
           const originalOpacity = mat.opacity !== undefined ? mat.opacity : 1.0;
