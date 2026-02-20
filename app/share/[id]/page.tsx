@@ -43,10 +43,25 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
             group.rotation.set(model.rotation.x, model.rotation.y, model.rotation.z);
             group.scale.set(model.scale.x, model.scale.y, model.scale.z);
 
+            // Apply render-style materials and shadows
             group.traverse((child) => {
               if (child instanceof THREE.Mesh) {
                 child.castShadow = true;
                 child.receiveShadow = true;
+
+                // Apply clean render material using the mesh's existing color
+                const existingMat = child.material as THREE.MeshStandardMaterial;
+                const baseColor = existingMat?.color ? existingMat.color.clone() : new THREE.Color(0xffffff);
+                const opacity = existingMat?.opacity ?? 1.0;
+
+                const renderMat = new THREE.MeshStandardMaterial({
+                  color: baseColor,
+                  roughness: 0.7,
+                  metalness: 0.0,
+                  transparent: opacity < 1,
+                  opacity: opacity,
+                });
+                child.material = renderMat;
               }
             });
 
