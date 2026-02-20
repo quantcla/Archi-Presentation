@@ -2695,6 +2695,7 @@ const SimulationViewer = ({
       const shareId = generateShareId();
 
       // Export mesh-based models to GLB
+      // Render materials are already applied (extractMeshParts + applyRenderMaterials run on model load)
       const exportableModels = models.filter(m => m.type === 'building' || m.type === 'environment');
       const modelBlobs = new Map<string, Blob>();
 
@@ -3900,12 +3901,13 @@ const SimulationViewer = ({
     setMeshParts(parts);
   }, [models]);
 
-  // Extract mesh parts when models change or entering render tab
+  // Extract mesh parts when models change (always, not just render tab)
+  // This ensures render materials are applied automatically on model load
   useEffect(() => {
-    if (ribbonTab === 'render') {
+    if (models.length > 0) {
       extractMeshParts();
     }
-  }, [ribbonTab, models, extractMeshParts]);
+  }, [models, extractMeshParts]);
 
   // Handle mesh part selection via raycasting (supports shift for multi-select)
   const handleRenderClick = useCallback((event: MouseEvent) => {
