@@ -104,6 +104,32 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
     };
   }, [scene, presentation, fitToBox]);
 
+  // Section plane wrapper: applies clipping but removes grey cap meshes
+  const applySectionCut = useCallback((y: number | null) => {
+    setSectionPlane(y);
+    // Remove the grey cap meshes created by ViewerContext — they look bad in shared view
+    if (scene) {
+      const capsToRemove: THREE.Object3D[] = [];
+      scene.traverse((obj) => {
+        if (obj.name === 'sectionCapMesh' || obj.name === 'sectionCapGroup') {
+          capsToRemove.push(obj);
+        }
+      });
+      capsToRemove.forEach((cap) => {
+        scene.remove(cap);
+        cap.traverse((child) => {
+          if (child instanceof THREE.Mesh) {
+            child.geometry?.dispose();
+            if (child.material) {
+              const materials = Array.isArray(child.material) ? child.material : [child.material];
+              materials.forEach((m) => m.dispose());
+            }
+          }
+        });
+      });
+    }
+  }, [scene, setSectionPlane]);
+
   // Update model visibility when slide changes
   const updateSlideVisibility = useCallback((slideIndex: number) => {
     const slide = presentation.slides[slideIndex];
@@ -115,11 +141,11 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
     });
 
     if (slide.sectionCut?.enabled) {
-      setSectionPlane(slide.sectionCut.height);
+      applySectionCut(slide.sectionCut.height);
     } else {
-      setSectionPlane(null);
+      applySectionCut(null);
     }
-  }, [presentation.slides, setSectionPlane]);
+  }, [presentation.slides, applySectionCut]);
 
   // Update hotspot meshes when slide changes
   useEffect(() => {
@@ -247,13 +273,13 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
 
         // Activate section cut if linked
         if (hotspot.sectionCutAction?.enabled) {
-          setSectionPlane(hotspot.sectionCutAction.height);
+          applySectionCut(hotspot.sectionCutAction.height);
         }
       }
     } else {
       setActiveHotspotId(null);
     }
-  }, [camera, scene, controls, activeSlide, setSectionPlane]);
+  }, [camera, scene, controls, activeSlide, applySectionCut]);
 
   // Close hotspot popup
   const closeHotspot = useCallback(() => {
@@ -262,12 +288,12 @@ function SharedViewerContent({ presentation }: { presentation: SharedPresentatio
     if (hotspot?.sectionCutAction?.enabled) {
       const slide = presentation.slides[activeSlideIndex];
       if (slide?.sectionCut?.enabled) {
-        setSectionPlane(slide.sectionCut.height);
+        applySectionCut(slide.sectionCut.height);
       } else {
-        setSectionPlane(null);
+        applySectionCut(null);
       }
     }
-  }, [activeHotspotId, activeSlide, activeSlideIndex, presentation.slides, setSectionPlane]);
+  }, [activeHotspotId, activeSlide, activeSlideIndex, presentation.slides, applySectionCut]);
 
   const hasImage = activeHotspot ? !!activeHotspot.linkedImage : false;
 
